@@ -110,6 +110,11 @@ type StreamConfig struct {
 	// subject delete markers.
 	SubjectDeleteMarkerTTL time.Duration `json:"subject_delete_marker_ttl,omitempty"`
 
+	// KeepLastPerSubject keeps the newest message per subject when messages
+	// are expired by MaxAge. Older expired messages are still removed.
+	// Mutually exclusive with SubjectDeleteMarkerTTL.
+	KeepLastPerSubject bool `json:"keep_last_per_subject,omitempty"`
+
 	// AllowMsgCounter allows a stream to use (only) counter CRDTs.
 	AllowMsgCounter bool `json:"allow_msg_counter,omitempty"`
 
@@ -1728,6 +1733,11 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("max age needs to be >= 100ms"))
 	}
 
+	// KeepLastPerSubject requires MaxAge to be set.
+	if cfg.KeepLastPerSubject && cfg.MaxAge == 0 {
+		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("keep_last_per_subject requires max_age to be set"))
+	}
+
 	if cfg.Duplicates == 0 && cfg.Mirror == nil && len(cfg.Sources) == 0 {
 		maxWindow := StreamDefaultDuplicatesWindow
 		if lim.Duplicates > 0 && maxWindow > lim.Duplicates {
@@ -1808,6 +1818,11 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 		}
 	} else if cfg.SubjectDeleteMarkerTTL < 0 {
 		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject delete marker TTL must not be negative"))
+	}
+
+	// KeepLastPerSubject is mutually exclusive with subject delete markers.
+	if cfg.KeepLastPerSubject && cfg.SubjectDeleteMarkerTTL > 0 {
+		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("keep_last_per_subject can not be set with subject_delete_marker_ttl"))
 	}
 
 	if cfg.AllowMsgSchedules {
@@ -2309,6 +2324,10 @@ func (jsa *jsAccount) configUpdateCheck(old, new *StreamConfig, s *Server, pedan
 	// Can not change from true to false.
 	if !cfg.DenyPurge && old.DenyPurge {
 		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not cancel deny purge"))
+	}
+	// Can not change from true to false.
+	if !cfg.KeepLastPerSubject && old.KeepLastPerSubject {
+		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("stream configuration update can not disable keep last per subject"))
 	}
 	// Check for mirror changes which are not allowed.
 	// We will allow removing the mirror config to "promote" the mirror to a normal stream.

@@ -680,6 +680,62 @@ func TestFileStoreAgeLimit(t *testing.T) {
 	})
 }
 
+func TestFileStoreKeepLastPerSubjectRecoverSkipped(t *testing.T) {
+	maxAge := 2 * time.Second
+	fcfg := FileStoreConfig{BlockSize: 8 * 1024, StoreDir: t.TempDir()}
+	cfg := StreamConfig{Name: "KLSR", Subjects: []string{"klsr.*"}, Storage: FileStorage, MaxAge: maxAge, KeepLastPerSubject: true}
+
+	var fs *fileStore
+	startFS := func() *fileStore {
+		t.Helper()
+		var err error
+		fs, err = newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		return fs
+	}
+
+	fs = startFS()
+	msg := []byte("Hello World")
+	// klsr.foo = 1..3, klsr.bar = 4..5
+	for i := 0; i < 3; i++ {
+		_, _, err := fs.StoreMsg("klsr.foo", nil, msg, 0)
+		require_NoError(t, err)
+	}
+	for i := 0; i < 2; i++ {
+		_, _, err := fs.StoreMsg("klsr.bar", nil, msg, 0)
+		require_NoError(t, err)
+	}
+	// Wait so all stored msgs are past MaxAge, then stop. The keep-last pass
+	// may have run before stop, keeping one per subject. Don't assert counts.
+	time.Sleep(3 * maxAge)
+	fs.Stop()
+
+	// Restart. recover is skipped for keep-last, so whatever survived is
+	// still present. The periodic expiry must converge to one-per-subject,
+	// keeping each subject's newest message (foo seq 3, bar seq 5).
+	fs = startFS()
+	defer fs.Stop()
+	checkFor(t, 5*time.Second, maxAge, func() error {
+		state := fs.State()
+		if state.Msgs != 2 {
+			return fmt.Errorf("Expected 2 msgs after periodic expiry, got %d", state.Msgs)
+		}
+		return nil
+	})
+	checkLast := func(subj string, want uint64) {
+		t.Helper()
+		fss := fs.SubjectsState(subj)
+		if len(fss) != 1 {
+			t.Fatalf("Expected 1 subject in state for %q, got %d", subj, len(fss))
+		}
+		if ss := fss[subj]; ss.Last != want {
+			t.Fatalf("Expected last seq %d for %q, got %d", want, subj, ss.Last)
+		}
+	}
+	checkLast("klsr.foo", 3)
+	checkLast("klsr.bar", 5)
+}
+
 func TestFileStoreTimeStamps(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
@@ -3285,6 +3341,71 @@ func TestFileStoreBadConsumerState(t *testing.T) {
 	if cs, err := decodeConsumerState(bs); err != nil || cs == nil {
 		t.Fatalf("Expected to not throw error, got %v and %+v", err, cs)
 	}
+}
+
+func TestFileStoreKeepLastPerSubject(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		if fcfg.Compression != NoCompression || fcfg.Cipher != NoCipher {
+			// Keep to the simple path; covered by the base permutation.
+			t.SkipNow()
+		}
+		fcfg.BlockSize = 8 * 1024
+		maxAge := 50 * time.Millisecond
+		cfg := StreamConfig{Name: "KLPS", Subjects: []string{"orders.*"}, Storage: FileStorage, MaxAge: maxAge, KeepLastPerSubject: true}
+		fs, err := newFileStoreWithCreated(fcfg, cfg, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		msg := bytes.Repeat([]byte("ABC"), 33) // ~100bytes
+		store := func(subj string, n int) {
+			t.Helper()
+			for i := 0; i < n; i++ {
+				if _, _, err := fs.StoreMsg(subj, nil, msg, 0); err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+			}
+		}
+
+		store("orders.1", 3)
+		store("orders.2", 2)
+
+		checkMsgs := func(want uint64) {
+			t.Helper()
+			checkFor(t, 2*time.Second, 5*time.Millisecond, func() error {
+				state := fs.State()
+				if state.Msgs != want {
+					return fmt.Errorf("Expected %d msgs, got %d", want, state.Msgs)
+				}
+				return nil
+			})
+		}
+		checkLast := func(subj string, want uint64) {
+			t.Helper()
+			ss := fs.SubjectsState(subj)
+			if len(ss) != 1 {
+				t.Fatalf("Expected 1 subject in state for %q, got %d", subj, len(ss))
+			}
+			if ss[subj].Msgs != 1 {
+				t.Fatalf("Expected 1 msg for %q, got %d", subj, ss[subj].Msgs)
+			}
+			if ss[subj].Last != want {
+				t.Fatalf("Expected last seq %d for %q, got %d", want, subj, ss[subj].Last)
+			}
+		}
+
+		// After TTL, each subject keeps its newest message.
+		checkMsgs(2)
+		// orders.1 had seq 1-3, orders.2 had 4-5.
+		checkLast("orders.1", 3)
+		checkLast("orders.2", 5)
+
+		// A new message on orders.1 becomes the newest; the retained seq 3
+		// is now stale and removed on the next expiry pass.
+		store("orders.1", 1) // seq 6
+		checkMsgs(2)
+		checkLast("orders.1", 6)
+		checkLast("orders.2", 5)
+	})
 }
 
 func TestFileStoreExpireMsgsOnStart(t *testing.T) {

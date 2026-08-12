@@ -213,6 +213,76 @@ func TestMemStoreAgeLimit(t *testing.T) {
 	checkExpired(t)
 }
 
+func TestMemStoreKeepLastPerSubject(t *testing.T) {
+	maxAge := 25 * time.Millisecond
+	ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage, MaxAge: maxAge, KeepLastPerSubject: true})
+	require_NoError(t, err)
+	defer ms.Stop()
+
+	msg := []byte("Hello World")
+	store := func(subj string, n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			_, _, err := ms.StoreMsg(subj, nil, msg, 0)
+			require_NoError(t, err)
+		}
+	}
+
+	// Two subjects, multiple msgs each.
+	store("foo", 3)
+	store("bar", 2)
+
+	// Wait until all of them are past MaxAge, then let the timer fire.
+	checkMsgs := func(want uint64) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 5*time.Millisecond, func() error {
+			state := ms.State()
+			if state.Msgs != want {
+				return fmt.Errorf("Expected %d msgs, got %d", want, state.Msgs)
+			}
+			return nil
+		})
+	}
+	checkMsgs(2)
+	checkLast := func(subj string, want uint64) {
+		t.Helper()
+		ss := ms.SubjectsState(subj)
+		if len(ss) != 1 {
+			t.Fatalf("Expected 1 subject in state for %q, got %d", subj, len(ss))
+		}
+		if ss[subj].Msgs != 1 {
+			t.Fatalf("Expected 1 msg for %q, got %d", subj, ss[subj].Msgs)
+		}
+		if ss[subj].Last != want {
+			t.Fatalf("Expected last seq %d for %q, got %d", want, subj, ss[subj].Last)
+		}
+	}
+	// foo had seq 1-3, bar had 4-5.
+	checkLast("foo", 3)
+	checkLast("bar", 5)
+
+	// A new message on foo should become the newest; the old retained one
+	// (seq 3) is now stale and should be removed on the next expiry pass.
+	store("foo", 1) // seq 6
+	checkMsgs(2)
+
+	state := ms.State()
+	if state.Msgs != 2 {
+		t.Fatalf("Expected 2 msgs kept after refresh, got %d", state.Msgs)
+	}
+	checkLast("foo", 6)
+	checkLast("bar", 5)
+
+	// The retained expired messages should not cause a busy loop: after the
+	// last pass the timer must be armed for roughly MaxAge, not 2s.
+	ms.mu.Lock()
+	ageChkArmed := ms.ageChk != nil
+	ms.mu.Unlock()
+	if !ageChkArmed {
+		t.Fatalf("Expected ageChk timer to be armed for retained expired msgs")
+	}
+}
+
 func TestMemStoreTimeStamps(t *testing.T) {
 	ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
 	require_NoError(t, err)

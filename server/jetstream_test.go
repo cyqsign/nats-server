@@ -20221,6 +20221,119 @@ func TestJetStreamCreateStreamWithSubjectDeleteMarkersOptions(t *testing.T) {
 	require_Error(t, err, errors.New("message TTL status can not be disabled"))
 }
 
+func TestJetStreamKeepLastPerSubjectConfig(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	// Requires MaxAge to be set.
+	cfg := StreamConfig{
+		Name:                "KLPC",
+		Storage:             FileStorage,
+		Subjects:            []string{"klpc"},
+		KeepLastPerSubject: true,
+	}
+	_, err := addStreamPedanticWithError(t, nc, &StreamConfigRequest{cfg, true})
+	require_Error(t, err, errors.New("keep_last_per_subject requires max_age to be set"))
+
+	// Mutually exclusive with subject delete markers.
+	cfg.MaxAge = time.Hour
+	cfg.SubjectDeleteMarkerTTL = time.Second
+	cfg.AllowMsgTTL = true
+	cfg.AllowRollup = true
+	cfg.DenyPurge = false
+	_, err = addStreamPedanticWithError(t, nc, &StreamConfigRequest{cfg, true})
+	require_Error(t, err, errors.New("keep_last_per_subject can not be set with subject_delete_marker_ttl"))
+
+	// Valid: MaxAge set, no SDM.
+	cfg.SubjectDeleteMarkerTTL = 0
+	si, err := addStreamPedanticWithError(t, nc, &StreamConfigRequest{cfg, false})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	require_True(t, si.Config.KeepLastPerSubject)
+
+	// Can not disable once enabled.
+	upd := si.Config
+	upd.KeepLastPerSubject = false
+	_, err = updateStreamPedanticWithError(t, nc, &StreamConfigRequest{upd, true})
+	require_Error(t, err, errors.New("stream configuration update can not disable keep last per subject"))
+}
+
+func TestJetStreamKeepLastPerSubject(t *testing.T) {
+	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			jsStreamCreate(t, nc, &StreamConfig{
+				Name:                "TEST",
+				Storage:             storage,
+				Subjects:            []string{"test.*"},
+				MaxAge:              250 * time.Millisecond,
+				KeepLastPerSubject:  true,
+			})
+
+			// foo: 3 msgs (seq 1-3), bar: 2 msgs (seq 4-5).
+			for i := 0; i < 3; i++ {
+				_, err := js.Publish("test.foo", nil)
+				require_NoError(t, err)
+			}
+			for i := 0; i < 2; i++ {
+				_, err := js.Publish("test.bar", nil)
+				require_NoError(t, err)
+			}
+
+			// After MaxAge, each subject should retain only its newest message.
+			checkFor(t, 3*time.Second, 25*time.Millisecond, func() error {
+				si, err := js.StreamInfo("TEST")
+				if err != nil {
+					return err
+				}
+				if si.State.Msgs != 2 {
+					return fmt.Errorf("Expected 2 msgs (one per subject), got %d", si.State.Msgs)
+				}
+				return nil
+			})
+
+			// The newest per subject must still be readable via direct get.
+			m, err := js.GetMsg("TEST", 3) // newest for test.foo
+			require_NoError(t, err)
+			require_Equal(t, m.Subject, "test.foo")
+			m, err = js.GetMsg("TEST", 5) // newest for test.bar
+			require_NoError(t, err)
+			require_Equal(t, m.Subject, "test.bar")
+
+			// A new message on foo makes the old newest (seq 3) stale; it
+			// should be removed on the next expiry pass.
+			_, err = js.Publish("test.foo", nil) // seq 6
+			require_NoError(t, err)
+			checkFor(t, 3*time.Second, 25*time.Millisecond, func() error {
+				si, err := js.StreamInfo("TEST")
+				if err != nil {
+					return err
+				}
+				if si.State.Msgs != 2 {
+					return fmt.Errorf("Expected 2 msgs after refresh, got %d", si.State.Msgs)
+				}
+				if si.State.LastSeq != 6 {
+					return fmt.Errorf("Expected last seq 6, got %d", si.State.LastSeq)
+				}
+				return nil
+			})
+			// seq 3 should now be gone.
+			if _, err := js.GetMsg("TEST", 3); err == nil {
+				t.Fatalf("Expected seq 3 to be removed after refresh")
+			}
+		})
+	}
+}
+
 func TestJetStreamTHWExpireTasksRace(t *testing.T) {
 	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
 		t.Run(storageType.String(), func(t *testing.T) {

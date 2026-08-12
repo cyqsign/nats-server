@@ -8658,6 +8658,70 @@ func TestJetStreamClusterSubjectDeleteMarkersTTLRollupWithMaxAge(t *testing.T) {
 	require_Equal(t, msg.Header.Get(JSMessageTTL), "1s")
 }
 
+func TestJetStreamClusterKeepLastPerSubject(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3K", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	jsStreamCreate(t, nc, &StreamConfig{
+		Name:               "TEST",
+		Storage:             FileStorage,
+		Replicas:            3,
+		Subjects:            []string{"test.*"},
+		MaxAge:              500 * time.Millisecond,
+		KeepLastPerSubject:  true,
+	})
+
+	// foo: 3 msgs (seq 1-3), bar: 2 msgs (seq 4-5).
+	for i := 0; i < 3; i++ {
+		_, err := js.Publish("test.foo", nil)
+		require_NoError(t, err)
+	}
+	for i := 0; i < 2; i++ {
+		_, err := js.Publish("test.bar", nil)
+		require_NoError(t, err)
+	}
+
+	// After MaxAge + replication, each subject should retain only its newest.
+	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+		si, err := js.StreamInfo("TEST")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 2 {
+			return fmt.Errorf("Expected 2 msgs (one per subject), got %d", si.State.Msgs)
+		}
+		return nil
+	})
+
+	// All replicas must agree on the retained sequences.
+	want := map[string]uint64{"test.foo": 3, "test.bar": 5}
+	for _, s := range c.servers {
+		mset, err := s.GlobalAccount().lookupStream("TEST")
+		if err != nil {
+			t.Fatalf("lookupStream on %s: %v", s.Name(), err)
+		}
+		fss := mset.store.SubjectsState(">")
+		if len(fss) != 2 {
+			t.Fatalf("Expected 2 subjects on %s, got %d", s.Name(), len(fss))
+		}
+		for subj, wantLast := range want {
+			ss, ok := fss[subj]
+			if !ok {
+				t.Fatalf("Missing subject %q on %s", subj, s.Name())
+			}
+			if ss.Msgs != 1 {
+				t.Fatalf("Expected 1 msg for %q on %s, got %d", subj, s.Name(), ss.Msgs)
+			}
+			if ss.Last != wantLast {
+				t.Fatalf("Expected last seq %d for %q on %s, got %d", wantLast, subj, s.Name(), ss.Last)
+			}
+		}
+	}
+}
+
 func TestJetStreamClusterSubjectDeleteMarkersTTLRollupWithoutMaxAge(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()

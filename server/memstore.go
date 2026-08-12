@@ -792,6 +792,28 @@ func (ms *memStore) SubjectsState(subject string) map[string]SimpleState {
 	return fss
 }
 
+// SubjectLastSeq returns the last sequence number for a literal subject,
+// or (0, false) if the subject is not tracked. Cheaper than SubjectsState
+// for single-subject lookups: O(|subj|) tree find, no map allocation.
+func (ms *memStore) SubjectLastSeq(subj string) (uint64, bool) {
+	if subj == _EMPTY_ {
+		return 0, false
+	}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.fss.Size() == 0 {
+		return 0, false
+	}
+	ss, ok := ms.fss.Find(stringToBytes(subj))
+	if !ok || ss == nil {
+		return 0, false
+	}
+	if ss.lastNeedsUpdate {
+		ms.recalculateForSubj(subj, ss)
+	}
+	return ss.Last, true
+}
+
 // AllLastSeqs will return a sorted list of last sequences for all subjects.
 func (ms *memStore) AllLastSeqs() ([]uint64, error) {
 	ms.mu.RLock()
@@ -1233,6 +1255,7 @@ func (ms *memStore) expireMsgs() {
 	pmsgcb := ms.pmsgcb
 	sdmTTL := int64(ms.cfg.SubjectDeleteMarkerTTL.Seconds())
 	sdmEnabled := sdmTTL > 0
+	keepLast := ms.cfg.KeepLastPerSubject && maxAge > 0
 
 	// If SDM is enabled, but handlers aren't set up yet. Try again later.
 	if sdmEnabled && (rmcb == nil || pmsgcb == nil) {
@@ -1243,12 +1266,45 @@ func (ms *memStore) expireMsgs() {
 	ms.ageChkRun = true
 	ms.mu.Unlock()
 
+	// keepLastPerSubject support: lazily fetch the latest sequence per subject
+	// and remember whether we retained any expired message this round. The
+	// retained flag drives the timer reschedule to avoid a 2s busy loop.
+	var kept bool
+	var lastSeqs map[string]uint64
+	getLastSeq := func(subj string) (uint64, bool) {
+		if lastSeqs != nil {
+			if seq, ok := lastSeqs[subj]; ok {
+				return seq, true
+			}
+		}
+		seq, ok := ms.SubjectLastSeq(subj)
+		if !ok {
+			return 0, false
+		}
+		if lastSeqs == nil {
+			lastSeqs = make(map[string]uint64, 16)
+		}
+		lastSeqs[subj] = seq
+		return seq, true
+	}
+
 	if maxAge > 0 {
 		var seq uint64
 		for sm, seq, _ = ms.LoadNextMsg(fwcs, true, 0, &smv); sm != nil && sm.ts <= minAge; sm, seq, _ = ms.LoadNextMsg(fwcs, true, seq+1, &smv) {
 			if len(sm.hdr) > 0 {
 				if ttl, err := getMessageTTL(sm.hdr); err == nil && ttl < 0 {
 					// The message has a negative TTL, therefore it must "never expire".
+					minAge = time.Now().UnixNano() - maxAge
+					continue
+				}
+			}
+			// Keep the newest message per subject when expiring by MaxAge.
+			// Determine via sequence equality rather than a count, since a
+			// negative-TTL (never-expire) message would otherwise inflate the
+			// count and cause the actual newest message to be removed.
+			if keepLast {
+				if lastSeq, ok := getLastSeq(sm.subj); ok && seq == lastSeq {
+					kept = true
 					minAge = time.Now().UnixNano() - maxAge
 					continue
 				}
@@ -1335,7 +1391,15 @@ func (ms *memStore) expireMsgs() {
 		ms.cancelAgeChk()
 	} else {
 		if sm == nil {
-			ms.resetAgeChk(0)
+			if kept {
+				// Remaining messages are all retained (expired but kept as the
+				// newest per subject). Re-check at MaxAge instead of the 2s
+				// fast loop, which is meant for SDM proposal follow-up. New
+				// messages arriving will re-arm the timer via storeRawMsg.
+				ms.resetAgeChk(maxAge)
+			} else {
+				ms.resetAgeChk(0)
+			}
 		} else {
 			ms.resetAgeChk(sm.ts - minAge)
 		}

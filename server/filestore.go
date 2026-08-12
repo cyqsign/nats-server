@@ -2610,6 +2610,14 @@ func (fs *fileStore) expireMsgsOnRecover() error {
 		return nil
 	}
 
+	// If keep-last-per-subject is configured, skip expiry on recover. Expiry
+	// is handled by the periodic expireMsgs instead. This trades a window
+	// (up to MaxAge after restart) where already-expired data is still
+	// readable, for faster startup and correctness of the keep-last logic.
+	if fs.cfg.KeepLastPerSubject {
+		return nil
+	}
+
 	var minAge = time.Now().UnixNano() - int64(fs.cfg.MaxAge)
 	var purged, bytes uint64
 	var deleted int
@@ -3785,6 +3793,62 @@ func (fs *fileStore) SubjectsState(subject string) map[string]SimpleState {
 	}
 
 	return fss
+}
+
+// SubjectLastSeq returns the last sequence number for a literal subject,
+// or (0, false) if the subject is not tracked. Cheaper than SubjectsState
+// for single-subject lookups because it consults only the msgBlock that
+// holds the subject's newest message (psi.lblk), avoiding the multi-block
+// scan and map allocation that SubjectsState performs.
+func (fs *fileStore) SubjectLastSeq(subj string) (uint64, bool) {
+	if subj == _EMPTY_ {
+		return 0, false
+	}
+	fs.mu.RLock()
+	if fs.state.Msgs == 0 || fs.noTrackSubjects() || fs.psim == nil {
+		fs.mu.RUnlock()
+		return 0, false
+	}
+	info, ok := fs.psim.Find(stringToBytes(subj))
+	if !ok {
+		fs.mu.RUnlock()
+		return 0, false
+	}
+	mb := fs.bim[info.lblk]
+	fs.mu.RUnlock()
+
+	if mb == nil {
+		return 0, false
+	}
+
+	mb.mu.Lock()
+	var shouldExpire bool
+	if mb.fssNotLoaded() {
+		if err := mb.loadMsgsWithLock(); err != nil {
+			mb.mu.Unlock()
+			return 0, false
+		}
+		shouldExpire = true
+	}
+	mb.lsts = ats.AccessTime()
+	var lastSeq uint64
+	var found bool
+	if ss, ok := mb.fss.Find(stringToBytes(subj)); ok && ss != nil {
+		if ss.lastNeedsUpdate {
+			if err := mb.recalculateForSubj(subj, ss); err == nil {
+				lastSeq, found = ss.Last, true
+			}
+		} else {
+			lastSeq, found = ss.Last, true
+		}
+	}
+	if shouldExpire {
+		mb.tryForceExpireCacheLocked()
+	} else {
+		mb.finishedWithCache()
+	}
+	mb.mu.Unlock()
+	return lastSeq, found
 }
 
 // AllLastSeqs will return a sorted list of last sequences for all subjects.
@@ -6973,6 +7037,7 @@ func (fs *fileStore) expireMsgs() {
 	pmsgcb := fs.pmsgcb
 	sdmTTL := int64(fs.cfg.SubjectDeleteMarkerTTL.Seconds())
 	sdmEnabled := sdmTTL > 0
+	keepLast := fs.cfg.KeepLastPerSubject && maxAge > 0
 
 	// If SDM is enabled, but handlers aren't set up yet. Try again later.
 	if sdmEnabled && (rmcb == nil || pmsgcb == nil) {
@@ -6983,12 +7048,45 @@ func (fs *fileStore) expireMsgs() {
 	fs.ageChkRun = true
 	fs.mu.Unlock()
 
+	// keepLastPerSubject support: lazily fetch the latest sequence per subject
+	// and remember whether we retained any expired message this round. The
+	// retained flag drives the timer reschedule to avoid a 2s busy loop.
+	var kept bool
+	var lastSeqs map[string]uint64
+	getLastSeq := func(subj string) (uint64, bool) {
+		if lastSeqs != nil {
+			if seq, ok := lastSeqs[subj]; ok {
+				return seq, true
+			}
+		}
+		seq, ok := fs.SubjectLastSeq(subj)
+		if !ok {
+			return 0, false
+		}
+		if lastSeqs == nil {
+			lastSeqs = make(map[string]uint64, 16)
+		}
+		lastSeqs[subj] = seq
+		return seq, true
+	}
+
 	if maxAge > 0 {
 		var seq uint64
 		for sm, seq, _ = fs.LoadNextMsg(fwcs, true, 0, &smv); sm != nil && sm.ts <= minAge; sm, seq, _ = fs.LoadNextMsg(fwcs, true, seq+1, &smv) {
 			if len(sm.hdr) > 0 {
 				if ttl, err := getMessageTTL(sm.hdr); err == nil && ttl < 0 {
 					// The message has a negative TTL, therefore it must "never expire".
+					minAge = ats.AccessTime() - maxAge
+					continue
+				}
+			}
+			// Keep the newest message per subject when expiring by MaxAge.
+			// Determine via sequence equality rather than a count, since a
+			// negative-TTL (never-expire) message would otherwise inflate the
+			// count and cause the actual newest message to be removed.
+			if keepLast {
+				if lastSeq, ok := getLastSeq(sm.subj); ok && seq == lastSeq {
+					kept = true
 					minAge = ats.AccessTime() - maxAge
 					continue
 				}
@@ -7012,6 +7110,13 @@ func (fs *fileStore) expireMsgs() {
 	var ageDelta int64
 	if sm != nil {
 		ageDelta = sm.ts - minAge
+	} else if kept {
+		// Remaining messages are all retained (expired but kept as the newest
+		// per subject). Re-check at MaxAge instead of falling through with a
+		// zero delta, which would trigger the 2s fast loop meant for SDM
+		// proposal follow-up. New messages arriving will re-arm the timer
+		// via storeRawMsg.
+		ageDelta = maxAge
 	}
 
 	fs.mu.Lock()
